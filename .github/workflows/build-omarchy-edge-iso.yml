@@ -1,0 +1,235 @@
+name: Build Omarchy edge ISO (aarch64)
+
+# Clones omacom/omarchy-iso, builds the aarch64 ISO from the edge channel,
+# optionally recompresses it, splits it into parts that fit GitHub's 2 GiB
+# per-asset limit, and publishes everything to a GitHub release on THIS repo.
+#
+# Put this file in .github/workflows/ of your own repository.
+#
+# Runner: the aarch64 builder is an arm64 container, so build on an arm64
+# runner (no emulation). `ubuntu-24.04-arm` is free on public repositories.
+# Upstream's own CI wants ~40-50 GB free; GitHub's standard runner is listed
+# at 14 GB of SSD, so the disk check below may stop the run. If it does, set
+# the repository variable ISO_RUNNER to a larger runner or to a self-hosted
+# arm64 runner (Settings > Secrets and variables > Actions > Variables).
+#
+# The ISO is unofficial and unsigned. Official releases are signed with
+# Omarchy's key; this build is not.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_ref:
+        description: "omarchy-iso branch or tag to build"
+        default: quattro
+        type: string
+      compression:
+        description: "Recompress the ISO before splitting (an ISO is already compressed, so the gain is small)"
+        default: zstd
+        type: choice
+        options: [zstd, xz, none]
+      part_mib:
+        description: "Maximum size of each uploaded file in MiB (GitHub's limit is 2048)"
+        default: "1900"
+        type: string
+      keep:
+        description: "Keep this many edge-aarch64 releases, delete older ones (0 keeps all)"
+        default: "5"
+        type: string
+  # schedule:
+  #   - cron: "30 0 * * *"   # nightly, after upstream's 00:01 UTC build
+
+concurrency:
+  group: build-omarchy-edge-iso
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    runs-on: ${{ vars.ISO_RUNNER || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 240
+    permissions:
+      contents: write
+    env:
+      ISO_REF: ${{ inputs.iso_ref || 'quattro' }}
+      COMPRESSION: ${{ inputs.compression || 'zstd' }}
+      PART_MIB: ${{ inputs.part_mib || '1900' }}
+      KEEP: ${{ inputs.keep || '5' }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          [[ $PART_MIB =~ ^[0-9]+$ ]] && (( PART_MIB >= 100 && PART_MIB <= 2000 )) \
+            || { echo "::error::part_mib must be a number from 100 to 2000"; exit 1; }
+          [[ $KEEP =~ ^[0-9]+$ ]] || { echo "::error::keep must be a number"; exit 1; }
+          [[ $ISO_REF =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::iso_ref has characters a ref can't"; exit 1; }
+
+      - name: Runner
+        shell: bash
+        run: |
+          uname -srm
+          echo "$(nproc) CPUs, $(free -h | awk 'NR==2 {print $2}') memory"
+          [[ $(uname -m) == aarch64 ]] || echo "::warning::not an arm64 runner; the aarch64 build would need emulation"
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/.ghcup /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Check disk space
+        shell: bash
+        run: |
+          avail_gb=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+          [ "$avail_gb" -ge 40 ] || {
+            echo "::error::only ${avail_gb} GB free; upstream's ISO build needs about 40 GB. Set the ISO_RUNNER variable to a larger or self-hosted arm64 runner."
+            exit 1
+          }
+
+      - name: Load the kernel features the image build needs
+        shell: bash
+        run: |
+          sudo modprobe loop || true
+          sudo modprobe btrfs || true
+          sudo modprobe overlay || true
+          grep -E 'btrfs|overlay' /proc/filesystems
+          grep -qw btrfs /proc/filesystems || { echo "::error::this runner's kernel has no btrfs, which the root image needs"; exit 1; }
+          ls /dev/loop-control
+
+      - name: Install tools
+        shell: bash
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd xz-utils jq
+
+      - name: Clone omacom/omarchy-iso
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: omacom/omarchy-iso
+          ref: ${{ env.ISO_REF }}
+          path: omarchy-iso
+          persist-credentials: false
+
+      # Same command upstream's nightly runs for edge-aarch64. Nothing is
+      # cached on purpose: every package is fetched fresh from the edge mirror.
+      - name: Build the edge ISO (aarch64)
+        shell: bash
+        working-directory: omarchy-iso
+        run: ./bin/omarchy-iso-make --arch aarch64 --edge --no-boot-offer 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Locate the ISO
+        id: iso
+        shell: bash
+        run: |
+          iso=$(ls -t omarchy-iso/release/omarchy-*.iso | head -n1)
+          [[ -f $iso ]] || { echo "::error::no ISO in omarchy-iso/release"; exit 1; }
+          echo "path=$iso" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$iso")" >> "$GITHUB_OUTPUT"
+          ls -lh "$iso"
+
+      - name: Compress and split
+        id: pack
+        shell: bash
+        env:
+          ISO: ${{ steps.iso.outputs.path }}
+          ISO_NAME: ${{ steps.iso.outputs.name }}
+        run: |
+          mkdir dist
+          sha256sum "$ISO" | awk -v n="$ISO_NAME" '{print $1 "  " n}' > "dist/$ISO_NAME.sha256"
+          case "$COMPRESSION" in
+            zstd) payload="dist/$ISO_NAME.zst"; zstd -19 --long=27 -T0 -q -f "$ISO" -o "$payload" ;;
+            xz)   payload="dist/$ISO_NAME.xz";  xz -9e -T0 -c "$ISO" > "$payload" ;;
+            none) payload="dist/$ISO_NAME";     cp "$ISO" "$payload" ;;
+            *)    echo "::error::unknown compression $COMPRESSION"; exit 1 ;;
+          esac
+          rm -f "$ISO"   # free the space before splitting
+          limit=$(( PART_MIB * 1024 * 1024 ))
+          if [ "$(stat -c %s "$payload")" -gt "$limit" ]; then
+            split -d -a 3 -b "${PART_MIB}M" "$payload" "$payload.part-"
+            rm -f "$payload"
+          fi
+          gzip -9 -c build.log > dist/build.log.gz
+          ( cd dist && sha256sum -- "$ISO_NAME"* build.log.gz | grep -v '\.sha256$' > SHA256SUMS )
+          ls -lh dist
+          echo "payload=$(basename "$payload")" >> "$GITHUB_OUTPUT"
+
+      - name: Write the release notes
+        id: notes
+        shell: bash
+        env:
+          ISO_NAME: ${{ steps.iso.outputs.name }}
+          PAYLOAD: ${{ steps.pack.outputs.payload }}
+        run: |
+          date_utc=$(date -u +%Y.%m.%d)
+          tag="edge-aarch64-$date_utc-${GITHUB_RUN_NUMBER}"
+          iso_commit=$(git -C omarchy-iso rev-parse --short HEAD)
+          dtbs=$(grep -aoE 'linux-omarchy-dtbs[ -]\(?[0-9][0-9A-Za-z._:+-]*' build.log | sort -u | head -3 | tr '\n' ';')
+          kernel=$(grep -aoE 'linux-omarchy-[0-9][0-9A-Za-z._:+-]*' build.log | sort -u | head -3 | tr '\n' ';')
+          if ls "dist/$PAYLOAD.part-"* >/dev/null 2>&1; then
+            case "$COMPRESSION" in
+              zstd) cmd="cat $PAYLOAD.part-* | zstd -d -o $ISO_NAME" ;;
+              xz)   cmd="cat $PAYLOAD.part-* | xz -d > $ISO_NAME" ;;
+              none) cmd="cat $PAYLOAD.part-* > $ISO_NAME" ;;
+            esac
+          else
+            case "$COMPRESSION" in
+              zstd) cmd="zstd -d $PAYLOAD -o $ISO_NAME" ;;
+              xz)   cmd="xz -d -k $PAYLOAD" ;;
+              none) cmd="true   # nothing to join or unpack" ;;
+            esac
+          fi
+          cat > notes.md <<EOF
+          Unofficial, unsigned Omarchy aarch64 ISO built from the edge channel on $date_utc.
+          Official ISOs are signed with Omarchy's key; this one is not.
+
+          - omarchy-iso: omacom/omarchy-iso at $ISO_REF ($iso_commit)
+          - linux-omarchy-dtbs seen in the build log: ${dtbs:-not found in the log}
+          - kernel packages seen in the build log: ${kernel:-not found in the log}
+          - runner: $(uname -m), built by GitHub Actions run ${GITHUB_RUN_ID}
+
+          ## Put the ISO back together
+
+          Download every file of this release, then check them:
+
+              sha256sum -c SHA256SUMS
+
+          On Linux, macOS or WSL:
+
+              $cmd
+              sha256sum -c $ISO_NAME.sha256
+
+          On Windows, join the parts with cmd (for example copy /b file.part-000 + file.part-001 joined),
+          then unpack with zstd or xz if the file name ends in .zst or .xz, and compare the SHA-256
+          in $ISO_NAME.sha256 with Get-FileHash.
+
+          Write the ISO to a USB stick with balenaEtcher or Rufus, and turn off Secure Boot.
+          EOF
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the GitHub release
+        shell: bash
+        env:
+          TAG: ${{ steps.notes.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Omarchy edge aarch64 $TAG" \
+            --notes-file notes.md \
+            --prerelease
+
+      - name: Delete older edge-aarch64 releases
+        if: env.KEEP != '0'
+        shell: bash
+        run: |
+          gh release list --limit 200 --json tagName,createdAt \
+            | jq -r --argjson keep "$KEEP" '[.[] | select(.tagName | startswith("edge-aarch64-"))]
+                | sort_by(.createdAt) | reverse | .[$keep:][] | .tagName' \
+            | while read -r old; do
+                echo "deleting $old"
+                gh release delete "$old" --yes --cleanup-tag
+              done
